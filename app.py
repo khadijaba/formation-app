@@ -1,24 +1,128 @@
 
 import os
+from pathlib import Path
+
 import joblib
 import numpy as np
+import pandas as pd
 from flask import Flask, request, jsonify, render_template_string
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+try:
+    from xgboost import XGBClassifier
+except Exception:
+    XGBClassifier = None
 
 app = Flask(__name__)
 
-# Chargement des modèles
-scaler = joblib.load("models/scaler.pkl")
-rf_model = joblib.load("models/rf_model.pkl")
-try:
-    xgb_model = joblib.load("models/xgb_model.pkl")
-except FileNotFoundError:
-    xgb_model = None
+BASE_DIR = Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "models"
+DATA_PATH = BASE_DIR / "freelancer_dataset_performant.csv"
 
 FEATURES = [
     "avg_skills", "avg_rating", "avg_interview", "avg_training",
     "experience", "n_applications", "acceptance_rate",
     "avg_skill_gap", "avg_rate", "avg_budget"
 ]
+
+
+def _derive_training_label(df_in: pd.DataFrame) -> pd.Series:
+    """
+    Construit une cible de type formation à partir du profil.
+    0: Aucune, 1: Technique, 2: Soft skills, 3: Complète.
+    """
+    skill_gap = np.clip(1.0 - df_in["skills_match"].astype(float), 0, 1)
+    tech_need = ((df_in["skills_match"] < 0.50) | (df_in["training_score"] < 60)).astype(int)
+    soft_need = ((df_in["interview_score"] < 60) | (df_in["previous_rating"] < 3.5)).astype(int)
+    heavy_gap = (skill_gap > 0.45).astype(int)
+
+    y = np.zeros(len(df_in), dtype=int)
+    y[(tech_need == 1) & (soft_need == 0)] = 1
+    y[(tech_need == 0) & (soft_need == 1)] = 2
+    y[(heavy_gap == 1) | ((tech_need == 1) & (soft_need == 1))] = 3
+    return pd.Series(y)
+
+
+def _prepare_training_frame(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    df = df_raw.copy()
+    df["n_applications"] = 1.0
+    df["acceptance_rate"] = df["accepted"].astype(float)
+    df["avg_skill_gap"] = np.clip(1.0 - df["skills_match"].astype(float), 0, 1)
+    df["avg_rate"] = df["freelancer_rate"].astype(float)
+    df["avg_budget"] = df["project_budget"].astype(float)
+    df["avg_skills"] = df["skills_match"].astype(float)
+    df["avg_rating"] = df["previous_rating"].astype(float)
+    df["avg_interview"] = df["interview_score"].astype(float)
+    df["avg_training"] = df["training_score"].astype(float)
+    df["experience"] = df["experience_years"].astype(float)
+
+    X = df[FEATURES].copy()
+    y = _derive_training_label(df)
+    return X, y
+
+
+def _train_and_save_models():
+    if not DATA_PATH.exists():
+        raise FileNotFoundError(
+            f"Dataset introuvable pour entraîner les modèles: {DATA_PATH}"
+        )
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    df_train = pd.read_csv(DATA_PATH)
+    X, y = _prepare_training_frame(df_train)
+    X_tr, X_te, y_tr, _ = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    scaler_local = StandardScaler()
+    X_tr_s = scaler_local.fit_transform(X_tr)
+
+    rf_local = RandomForestClassifier(
+        n_estimators=250, random_state=42, class_weight="balanced"
+    )
+    rf_local.fit(X_tr_s, y_tr)
+
+    xgb_local = None
+    if XGBClassifier is not None:
+        xgb_local = XGBClassifier(
+            n_estimators=200,
+            max_depth=5,
+            learning_rate=0.08,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            objective="multi:softprob",
+            num_class=4,
+            random_state=42,
+            eval_metric="mlogloss",
+        )
+        xgb_local.fit(X_tr_s, y_tr)
+
+    joblib.dump(scaler_local, MODELS_DIR / "scaler.pkl")
+    joblib.dump(rf_local, MODELS_DIR / "rf_model.pkl")
+    if xgb_local is not None:
+        joblib.dump(xgb_local, MODELS_DIR / "xgb_model.pkl")
+
+    return scaler_local, rf_local, xgb_local
+
+
+def _load_or_build_models():
+    scaler_path = MODELS_DIR / "scaler.pkl"
+    rf_path = MODELS_DIR / "rf_model.pkl"
+    xgb_path = MODELS_DIR / "xgb_model.pkl"
+
+    if scaler_path.exists() and rf_path.exists():
+        scaler_local = joblib.load(scaler_path)
+        rf_local = joblib.load(rf_path)
+        xgb_local = joblib.load(xgb_path) if xgb_path.exists() else None
+        return scaler_local, rf_local, xgb_local
+
+    return _train_and_save_models()
+
+
+# Chargement des modèles (avec fallback auto-entraînement si les .pkl manquent)
+scaler, rf_model, xgb_model = _load_or_build_models()
 
 LABELS = {
     0: "Aucune formation nécessaire",
